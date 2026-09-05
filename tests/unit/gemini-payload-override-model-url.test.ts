@@ -54,3 +54,42 @@ test("gemini buildUrl keeps the executor model when the body model matches", () 
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent"
   );
 });
+
+test("gemini buildUrlForBody falls back to the executor model when the body has no model", () => {
+  const executor = new DefaultExecutor("gemini");
+  const url = executor.buildUrlForBody("gemini-3.7-flash", { contents: [] }, false, 0, CREDENTIALS);
+  assert.equal(
+    url,
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent"
+  );
+});
+
+test("gemini execute() fetches the rewritten body.model, not the alias", async () => {
+  const executor = new DefaultExecutor("gemini");
+  const originalFetch = globalThis.fetch;
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    seen.push(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    const result = await executor.execute({
+      model: "gemini-3.7-flash-high",
+      body: {
+        model: "gemini-3.7-flash",
+        contents: [{ role: "user", parts: [{ text: "hi" }] }],
+      },
+      stream: true,
+      credentials: CREDENTIALS,
+    } as never);
+    const captured = result && typeof result === "object" && "url" in result ? result.url : undefined;
+    assert.match(
+      String(captured || seen[0] || ""),
+      /\/models\/gemini-3\.7-flash:streamGenerateContent/
+    );
+    assert.doesNotMatch(String(captured || seen[0] || ""), /gemini-3\.7-flash-high/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
