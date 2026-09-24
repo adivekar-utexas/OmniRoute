@@ -11,7 +11,10 @@ test("the checked-in inventory only lists files that exist", () => {
   const inv = JSON.parse(
     fs.readFileSync(path.join(ROOT, "config/quality/vitest-exclusions.json"), "utf8")
   );
-  assert.ok(inv.excluded.length > 0, "inventory is not empty");
+  // `excluded: []` is the healthy end state (every quarantined file has been repaired and
+  // returned to normal discovery), so the inventory is only required to be well-formed —
+  // NOT non-empty. See _measured in vitexclusions.json / #14493.
+  assert.ok(Array.isArray(inv.excluded), "excluded is an array");
   for (const entry of inv.excluded) {
     assert.ok(fs.existsSync(path.join(ROOT, entry.file)), `${entry.file} exists`);
     assert.match(entry.issue, /^#\d+$/, `${entry.file} names a tracking issue`);
