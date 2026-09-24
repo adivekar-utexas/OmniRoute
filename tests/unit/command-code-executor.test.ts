@@ -86,7 +86,9 @@ async function captureCliFallback(body: Record<string, unknown>) {
     return new Response(cliSse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
   };
 
-  await (await getExecutor("command-code")).execute({
+  await (
+    await getExecutor("command-code")
+  ).execute({
     model: "gpt-5.6-luna",
     stream: false,
     credentials: { apiKey: "cc_go_plan_key" },
@@ -199,7 +201,9 @@ test("Command Code executor passes reasoning/thinking fields through at the top 
 
 test("Command Code executor routes a Responses-shaped body to /provider/v1/responses", async () => {
   const calls = captureFetch({ id: "resp_1", object: "response", output: [] });
-  const { url } = await (await getExecutor("command-code")).execute({
+  const { url } = await (
+    await getExecutor("command-code")
+  ).execute({
     model: "gpt-5.6-luna",
     stream: false,
     credentials: { apiKey: "cc_test_key" },
@@ -227,7 +231,9 @@ test("Command Code executor routes a Responses-shaped body to /provider/v1/respo
 
 test("Command Code executor keeps a chat-shaped body on /provider/v1/chat/completions", async () => {
   const calls = captureFetch({});
-  const { url } = await (await getExecutor("command-code")).execute({
+  const { url } = await (
+    await getExecutor("command-code")
+  ).execute({
     model: "gpt-5.6-luna",
     stream: false,
     credentials: { apiKey: "cc_test_key" },
@@ -244,7 +250,9 @@ test("Command Code executor keeps a chat-shaped body on /provider/v1/chat/comple
 
 test("Command Code executor clamps an oversized max_output_tokens on the Responses path", async () => {
   const calls = captureFetch({});
-  await (await getExecutor("command-code")).execute({
+  await (
+    await getExecutor("command-code")
+  ).execute({
     model: "gpt-5.6-luna",
     stream: false,
     credentials: { apiKey: "cc_test_key" },
@@ -273,7 +281,9 @@ test("Command Code /alpha/generate fallback projects a Responses-shaped body ont
     return new Response(cliSse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
   };
 
-  await (await getExecutor("command-code")).execute({
+  await (
+    await getExecutor("command-code")
+  ).execute({
     model: "gpt-5.6-luna",
     stream: false,
     credentials: { apiKey: "cc_go_plan_key" },
@@ -354,7 +364,9 @@ test("Command Code executor treats a body carrying both input and messages as ch
   // `messages` is the Chat discriminator and wins: `input` is only consulted when
   // `messages` is absent. Pinned so an accidental flip cannot silently reroute.
   const calls = captureFetch({});
-  const { url } = await (await getExecutor("command-code")).execute({
+  const { url } = await (
+    await getExecutor("command-code")
+  ).execute({
     model: "gpt-5.6-luna",
     stream: false,
     credentials: { apiKey: "cc_test_key" },
@@ -377,7 +389,9 @@ test("Command Code /alpha/generate fallback skips a Responses body with no faith
 
   // A reasoning item is Responses-only: it has no `role`, so projecting it onto
   // `messages` would silently drop it and corrupt the replay.
-  const { response } = await (await getExecutor("command-code")).execute({
+  const { response } = await (
+    await getExecutor("command-code")
+  ).execute({
     model: "gpt-5.6-luna",
     stream: false,
     credentials: { apiKey: "cc_go_plan_key" },
@@ -397,7 +411,9 @@ test("Command Code /alpha/generate fallback skips a Responses body with no faith
 
 test("Command Code executor floors a tiny muse-spark max_output_tokens on the Responses path", async () => {
   const calls = captureFetch({});
-  await (await getExecutor("command-code")).execute({
+  await (
+    await getExecutor("command-code")
+  ).execute({
     model: "meta/muse-spark-1.3",
     stream: false,
     credentials: { apiKey: "cc_test_key" },
@@ -409,6 +425,25 @@ test("Command Code executor floors a tiny muse-spark max_output_tokens on the Re
   const posted = calls[0].body as Record<string, unknown>;
   assert.equal(posted.max_output_tokens, 512);
   assert.ok(!("max_tokens" in posted), "Responses shape must not grow a Chat max_tokens");
+});
+
+test("Command Code executor still floors muse-spark max_tokens on the Chat path after the Responses early-return", async () => {
+  const calls = captureFetch({});
+  await (
+    await getExecutor("command-code")
+  ).execute({
+    model: "meta/muse-spark-1.3",
+    stream: false,
+    credentials: { apiKey: "cc_test_key" },
+    body: { messages: [{ role: "user", content: "Hi" }], max_tokens: 64 },
+  });
+
+  // The Responses branch returns early; a Chat-shaped body must fall through to
+  // the Chat floor and keep the Chat endpoint + Chat cap field.
+  const posted = calls[0].body as Record<string, unknown>;
+  assert.equal(calls[0].url, "https://api.commandcode.ai/provider/v1/chat/completions");
+  assert.equal(posted.max_tokens, 512);
+  assert.ok(!("max_output_tokens" in posted), "Chat shape must not grow a Responses cap");
 });
 
 test("Command Code executor honors body.model rewrite from payload rules", async () => {
