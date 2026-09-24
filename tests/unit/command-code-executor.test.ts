@@ -222,6 +222,98 @@ test("Command Code executor clamps an oversized max_output_tokens on the Respons
   assert.equal(posted.max_output_tokens, 200000);
 });
 
+test("Command Code /alpha/generate fallback projects a Responses-shaped body onto messages", async () => {
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const urlStr = String(url);
+    calls.push({ url: urlStr, body: JSON.parse(String(init.body)) });
+
+    if (urlStr.includes("/provider/v1/responses")) {
+      return new Response(
+        JSON.stringify({ error: { message: "upgrade_required", code: "upgrade_required" } }),
+        { status: 403, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    const cliSse =
+      'data: {"type":"text-delta","text":"ok"}\n\n' +
+      'data: {"type":"finish","finishReason":"stop","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2}}\n\n';
+    return new Response(cliSse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  };
+
+  await (await getExecutor("command-code")).execute({
+    model: "gpt-5.6-luna",
+    stream: false,
+    credentials: { apiKey: "cc_go_plan_key" },
+    body: {
+      input: [{ role: "user", content: "Hi there" }],
+      reasoning: { effort: "none" },
+      max_output_tokens: 256,
+    },
+  });
+
+  assert.equal(calls.length, 2);
+  const cli = calls[1];
+  assert.ok(cli.url.includes("/alpha/generate"), `expected CLI fallback, got ${cli.url}`);
+  // A Responses request has no `messages`; the /alpha/generate surface nests its
+  // Chat-shaped payload under `params`. The fallback must project `input` onto
+  // `params.messages`, never send an empty list.
+  const params = cli.body.params as Record<string, unknown>;
+  const sent = params.messages as Array<{ role: string; content: unknown }>;
+  assert.ok(Array.isArray(sent), `expected params.messages to be an array, got ${typeof sent}`);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].role, "user");
+  assert.match(JSON.stringify(sent[0].content), /Hi there/);
+  // And the Responses output cap must survive as the CLI's max_tokens.
+  assert.equal(params.max_tokens, 256);
+});
+
+test("Command Code /alpha/generate fallback skips a Responses body with no faithful CLI form", async () => {
+  const calls: string[] = [];
+  globalThis.fetch = async (url) => {
+    const urlStr = String(url);
+    calls.push(urlStr);
+    return new Response(
+      JSON.stringify({ error: { message: "upgrade_required", code: "upgrade_required" } }),
+      { status: 403, headers: { "Content-Type": "application/json" } }
+    );
+  };
+
+  // A reasoning item is Responses-only: it has no `role`, so projecting it onto
+  // `messages` would silently drop it and corrupt the replay.
+  const { response } = await (await getExecutor("command-code")).execute({
+    model: "gpt-5.6-luna",
+    stream: false,
+    credentials: { apiKey: "cc_go_plan_key" },
+    body: {
+      input: [
+        { type: "reasoning", id: "rs_1", summary: [] },
+        { role: "user", content: "Hi" },
+      ],
+    },
+  });
+
+  assert.equal(calls.length, 1, "must not replay a mangled body to /alpha/generate");
+  assert.ok(calls[0].includes("/provider/v1/responses"));
+  // The upstream error surfaces rather than being masked by a broken fallback.
+  assert.equal(response.status, 403);
+});
+
+test("Command Code executor floors a tiny muse-spark max_output_tokens on the Responses path", async () => {
+  const calls = captureFetch({});
+  await (await getExecutor("command-code")).execute({
+    model: "meta/muse-spark-1.3",
+    stream: false,
+    credentials: { apiKey: "cc_test_key" },
+    body: { input: "Hi", max_output_tokens: 64 },
+  });
+
+  // Hidden reasoning eats the output budget first, so the floor has to apply on
+  // max_output_tokens exactly as it does on the Chat path's max_tokens.
+  const posted = calls[0].body as Record<string, unknown>;
+  assert.equal(posted.max_output_tokens, 512);
+  assert.ok(!("max_tokens" in posted), "Responses shape must not grow a Chat max_tokens");
+});
+
 test("Command Code executor honors body.model rewrite from payload rules", async () => {
   const calls = captureFetch({});
   (await getExecutor("command-code")).execute({

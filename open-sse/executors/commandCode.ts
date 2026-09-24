@@ -75,12 +75,16 @@ function clampMaxTokens(value: unknown): number | undefined {
  */
 const MUSE_SPARK_MIN_OUTPUT_TOKENS = 512;
 
-function applyMuseSparkMinOutputTokens(model: string, body: JsonRecord): void {
+function applyMuseSparkMinOutputTokens(
+  model: string,
+  body: JsonRecord,
+  field: "max_tokens" | "max_output_tokens" = "max_tokens"
+): void {
   if (!MUSE_SPARK_PATTERN.test(model)) return;
-  const current = body.max_tokens;
+  const current = body[field];
   if (typeof current !== "number" || !Number.isFinite(current)) return;
   if (current >= MUSE_SPARK_MIN_OUTPUT_TOKENS) return;
-  body.max_tokens = MUSE_SPARK_MIN_OUTPUT_TOKENS;
+  body[field] = MUSE_SPARK_MIN_OUTPUT_TOKENS;
 }
 
 const COMMAND_CODE_PASSTHROUGH_FIELDS = [
@@ -127,6 +131,46 @@ function isResponsesShapedBody(body: unknown): boolean {
   return body.input !== undefined && body.messages === undefined;
 }
 
+/**
+ * Project a Responses-shaped body onto the Chat shape `/alpha/generate` speaks.
+ *
+ * The CLI fallback is `messages`-based (`buildCommandCodeCliBody` reads
+ * `input.messages` and `input.max_tokens`), but a Responses request carries
+ * `input` and `max_output_tokens` instead. Replaying it unchanged sends an empty
+ * message list and drops the output cap, so the two have to be projected.
+ *
+ * Returns `null` when the request has no faithful CLI form. Reasoning items,
+ * `function_call`/`function_call_output` items, and encrypted reasoning content
+ * are Responses-only; silently dropping them would corrupt the replay, so those
+ * bail out and the caller surfaces the upstream error instead.
+ */
+function projectResponsesForCli(body: JsonRecord): JsonRecord | null {
+  const raw = body.input;
+  const messages: JsonRecord[] = [];
+
+  if (typeof raw === "string") {
+    messages.push({ role: "user", content: raw });
+  } else if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (!isRecord(item)) return null;
+      const { role, content } = item;
+      if (role !== "user" && role !== "system" && role !== "assistant") return null;
+      messages.push({ role, content });
+    }
+    if (messages.length === 0) return null;
+  } else {
+    return null;
+  }
+
+  const out: JsonRecord = { ...body, messages };
+  delete out.input;
+  if (typeof body.max_output_tokens === "number") {
+    out.max_tokens = body.max_output_tokens;
+  }
+  delete out.max_output_tokens;
+  return out;
+}
+
 // ── OpenAi Flat Body Builder (/provider/v1/chat/completions) ─────────────────
 
 function buildOpenAiBody(model: string, body: unknown, stream: boolean): { body: JsonRecord } {
@@ -156,7 +200,7 @@ function buildOpenAiBody(model: string, body: unknown, stream: boolean): { body:
     if (maxOutput !== undefined) {
       out.max_output_tokens = maxOutput;
     }
-    applyMuseSparkMinOutputTokens(resolvedModel, out);
+    applyMuseSparkMinOutputTokens(resolvedModel, out, "max_output_tokens");
     return { body: out };
   }
 
@@ -1061,7 +1105,15 @@ export class CommandCodeExecutor extends BaseExecutor {
     // Fallback: If /provider/v1/chat/completions returns 403 (e.g. Go plan without Provider
     // API access) or 404, fallback to /alpha/generate (CLI endpoint).
     if (upstream.status === 403 || upstream.status === 404) {
-      return this.executeCliFallback({ model, sanitizedBody, stream, apiKey, signal, upstreamExtraHeaders });
+      // /alpha/generate is Chat-shaped, so a Responses request must be projected
+      // onto `messages` first. When it has no faithful CLI form, skip the fallback
+      // and surface the upstream error rather than replaying a mangled body.
+      const cliShaped = isResponsesShapedBody(sanitizedBody)
+        ? projectResponsesForCli(sanitizedBody as JsonRecord)
+        : sanitizedBody;
+      if (cliShaped !== null) {
+        return this.executeCliFallback({ model, sanitizedBody: cliShaped, stream, apiKey, signal, upstreamExtraHeaders });
+      }
     }
 
     const errorText = await upstream.text().catch(() => {
