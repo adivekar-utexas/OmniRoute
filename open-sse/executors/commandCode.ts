@@ -114,6 +114,19 @@ function normalizeCommandCodeWireModel(model: string): string {
   return COMMAND_CODE_BARE_MODEL_VENDOR_PREFIX[bare] ?? bare;
 }
 
+/**
+ * True for an OpenAI Responses-shaped body (`input`, not `messages`). Command Code
+ * serves OpenAI models on BOTH /chat/completions and /responses, but only the
+ * Responses endpoint honors `reasoning: {"effort": "none"}` (the chat validator
+ * accepts low|medium|high|xhigh|max only, and silently ignores a nested
+ * `reasoning.effort`). Route Responses-shaped bodies there so a no-thinking
+ * request can actually disable reasoning.
+ */
+function isResponsesShapedBody(body: unknown): boolean {
+  if (!isRecord(body)) return false;
+  return body.input !== undefined && body.messages === undefined;
+}
+
 // ── OpenAi Flat Body Builder (/provider/v1/chat/completions) ─────────────────
 
 function buildOpenAiBody(model: string, body: unknown, stream: boolean): { body: JsonRecord } {
@@ -128,6 +141,24 @@ function buildOpenAiBody(model: string, body: unknown, stream: boolean): { body:
     model: resolvedModel,
     stream: stream === true,
   };
+
+  // Forward max_tokens only when the client actually supplied a positive value
+  // (clamped to the endpoint ceiling). Omitting it lets the provider's upstream
+  // apply the model's own native default; a non-positive value such as -1
+  // ("let the server choose") must be omitted, NOT coerced to 1 (#5166).
+  if (isResponsesShapedBody(out)) {
+    // Responses shape: the cap lives on max_output_tokens; leave it clamped and
+    // never fabricate a Chat-shaped max_tokens alongside it.
+    const maxOutput = clampMaxTokens(out.max_output_tokens);
+    delete out.max_tokens;
+    delete out.max_completion_tokens;
+    delete out.max_output_tokens;
+    if (maxOutput !== undefined) {
+      out.max_output_tokens = maxOutput;
+    }
+    applyMuseSparkMinOutputTokens(resolvedModel, out);
+    return { body: out };
+  }
 
   const maxTokens = clampMaxTokens(input.max_tokens ?? input.max_completion_tokens);
   delete out.max_tokens;
@@ -915,6 +946,20 @@ export class CommandCodeExecutor extends BaseExecutor {
     return `${baseUrl}${this.config.chatPath || "/provider/v1/chat/completions"}`;
   }
 
+  /**
+   * OpenAI Responses endpoint for models whose targetFormat is
+   * `openai-responses`. Same base + auth as chat; Command Code serves OpenAI and
+   * open models on both surfaces, but only /responses honors
+   * `reasoning: {"effort": "none"}` — the chat validator's effort enum has no
+   * disable value and silently drops a nested `reasoning.effort` (verified live
+   * 2026-09-24: /responses + effort none → reasoning_tokens 0; /chat +
+   * `reasoning:{effort:"none"}` → reasoning_tokens 41).
+   */
+  buildResponsesUrl() {
+    const baseUrl = (this.config.baseUrl || "https://api.commandcode.ai").replace(/\/$/, "");
+    return `${baseUrl}/provider/v1/responses`;
+  }
+
   buildCliUrl() {
     const baseUrl = (this.config.baseUrl || "https://api.commandcode.ai").replace(/\/$/, "");
     return `${baseUrl}/alpha/generate`;
@@ -926,7 +971,10 @@ export class CommandCodeExecutor extends BaseExecutor {
 
     const sanitizedBody = sanitizeReasoningEffortForProvider(body, this.provider, model);
     const { body: transformedBody } = buildOpenAiBody(model, sanitizedBody, stream);
-    const url = this.buildUrl();
+    // Route by body shape: a Responses-shaped body (targetFormat openai-responses)
+    // must hit /provider/v1/responses, where `reasoning: {"effort":"none"}` is
+    // honored; the chat endpoint silently drops it.
+    const url = isResponsesShapedBody(transformedBody) ? this.buildResponsesUrl() : this.buildUrl();
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
