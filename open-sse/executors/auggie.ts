@@ -23,7 +23,7 @@
  *   5. ~/.auggie/bin/auggie                  (alternate installer layout)
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type SpawnOptions } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
@@ -94,7 +94,7 @@ export async function initAuggieModels(
   }
   const child = spawn(bin, ["model", "list"], buildAuggieSpawnOptions(["ignore", "pipe", "pipe"]));
   const fragments: string[] = [];
-  child.stdout.on("data", (d: Buffer) => fragments.push(d.toString("utf8")));
+  child.stdout?.on("data", (d: Buffer) => fragments.push(d.toString("utf8")));
   let settled = false;
   const settle = (result: Set<string>) => {
     if (settled) return;
@@ -213,14 +213,7 @@ function buildAuggieArgs(model: string): string[] {
  * elements to the shell, it does not concatenate them into a single
  * command line.
  */
-export function buildAuggieSpawnOptions<S extends readonly string[]>(
-  stdio: S
-): {
-  env: NodeJS.ProcessEnv;
-  stdio: S;
-  shell: boolean;
-  windowsHide: true;
-} {
+export function buildAuggieSpawnOptions(stdio: SpawnOptions["stdio"]): SpawnOptions {
   return {
     env: process.env,
     stdio,
@@ -495,10 +488,12 @@ export class AuggieExecutor extends BaseExecutor {
     // stdin (not a sync throw), so the try/catch below cannot swallow it — without
     // this handler the unhandled stream error crashes the process instead of
     // letting the child's own 'error'/'close' handlers surface the failure.
-    child.stdin.on("error", () => {});
+    child.stdin?.on("error", () => {});
     try {
-      child.stdin.write(promptText);
-      child.stdin.end();
+      if (child.stdin) {
+        child.stdin.write(promptText);
+        child.stdin.end();
+      }
     } catch {
       /* ignore write errors — 'error'/'close' handlers surface the failure */
     }
