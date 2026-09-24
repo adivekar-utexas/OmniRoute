@@ -164,6 +164,64 @@ test("Command Code executor passes reasoning/thinking fields through at the top 
   assert.deepEqual(posted.extra_body, { enable_thinking: true });
 });
 
+test("Command Code executor routes a Responses-shaped body to /provider/v1/responses", async () => {
+  const calls = captureFetch({ id: "resp_1", object: "response", output: [] });
+  const { url } = await (await getExecutor("command-code")).execute({
+    model: "gpt-5.6-luna",
+    stream: false,
+    credentials: { apiKey: "cc_test_key" },
+    body: {
+      stream: false,
+      input: [{ role: "user", content: "Hi" }],
+      reasoning: { effort: "none" },
+      max_output_tokens: 256,
+    },
+  });
+
+  assert.equal(url, "https://api.commandcode.ai/provider/v1/responses");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.commandcode.ai/provider/v1/responses");
+
+  const posted = calls[0].body as Record<string, unknown>;
+  // The Responses reasoning field — the only knob Command Code honors for
+  // effort "none" — must survive untouched.
+  assert.deepEqual(posted.reasoning, { effort: "none" });
+  assert.equal(posted.messages, undefined, "Responses shape must not grow a messages field");
+  // Responses output cap is max_output_tokens; no fabricated Chat max_tokens.
+  assert.equal(posted.max_output_tokens, 256);
+  assert.ok(!("max_tokens" in posted));
+});
+
+test("Command Code executor keeps a chat-shaped body on /provider/v1/chat/completions", async () => {
+  const calls = captureFetch({});
+  const { url } = await (await getExecutor("command-code")).execute({
+    model: "gpt-5.6-luna",
+    stream: false,
+    credentials: { apiKey: "cc_test_key" },
+    body: {
+      stream: false,
+      messages: [{ role: "user", content: "Hi" }],
+      reasoning_effort: "none",
+    },
+  });
+
+  assert.equal(url, "https://api.commandcode.ai/provider/v1/chat/completions");
+  assert.equal(calls[0].url, "https://api.commandcode.ai/provider/v1/chat/completions");
+});
+
+test("Command Code executor clamps an oversized max_output_tokens on the Responses path", async () => {
+  const calls = captureFetch({});
+  await (await getExecutor("command-code")).execute({
+    model: "gpt-5.6-luna",
+    stream: false,
+    credentials: { apiKey: "cc_test_key" },
+    body: { input: "Hi", max_output_tokens: 500000 },
+  });
+
+  const posted = calls[0].body as Record<string, unknown>;
+  assert.equal(posted.max_output_tokens, 200000);
+});
+
 test("Command Code executor honors body.model rewrite from payload rules", async () => {
   const calls = captureFetch({});
   (await getExecutor("command-code")).execute({
