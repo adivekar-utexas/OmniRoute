@@ -965,6 +965,70 @@ export class CommandCodeExecutor extends BaseExecutor {
     return `${baseUrl}/alpha/generate`;
   }
 
+  /**
+   * Fallback path when the flat provider endpoint rejects with 403/404 (e.g. a Go
+   * plan without Provider API access, or a model only served on the CLI endpoint).
+   * Rebuilds the body in Command Code's CLI shape and posts to /alpha/generate.
+   */
+  private async executeCliFallback(input: {
+    model: string;
+    sanitizedBody: unknown;
+    stream: boolean;
+    apiKey: string;
+    signal?: AbortSignal;
+    upstreamExtraHeaders?: Record<string, string>;
+  }) {
+    const { model, sanitizedBody, stream, apiKey, signal, upstreamExtraHeaders } = input;
+    const cliUrl = this.buildCliUrl();
+    const cliHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+      "x-command-code-version": COMMAND_CODE_VERSION,
+      "x-cli-environment": "external",
+      "x-project-slug": "pi-cc",
+      "x-taste-learning": "false",
+      "x-co-flag": "false",
+      "x-session-id": randomUUID(),
+    };
+    mergeUpstreamExtraHeaders(cliHeaders, upstreamExtraHeaders);
+
+    const { body: cliTransformedBody, toolNameMap } = buildCommandCodeCliBody(
+      model,
+      sanitizedBody,
+      stream
+    );
+
+    const cliUpstream = await fetch(cliUrl, {
+      method: "POST",
+      headers: cliHeaders,
+      body: JSON.stringify(cliTransformedBody),
+      signal: signal || undefined,
+    });
+
+    if (!cliUpstream.ok) {
+      const errorText = await cliUpstream.text().catch(() => {
+        console.warn("[commandCode] cli upstream text failed");
+        return "";
+      });
+      return {
+        response: new Response(errorText || `Command Code API error ${cliUpstream.status}`, {
+          status: cliUpstream.status,
+          statusText: cliUpstream.statusText,
+          headers: cliUpstream.headers,
+        }),
+        url: cliUrl,
+        headers: cliHeaders,
+        transformedBody: cliTransformedBody,
+      };
+    }
+
+    const response = stream
+      ? createStreamResponse(cliUpstream, model, signal, toolNameMap)
+      : await createJsonResponse(cliUpstream, model, signal, toolNameMap);
+
+    return { response, url: cliUrl, headers: cliHeaders, transformedBody: cliTransformedBody };
+  }
+
   async execute({ model, body, stream, credentials, signal, upstreamExtraHeaders }: ExecuteInput) {
     const apiKey = credentials?.apiKey || credentials?.accessToken;
     if (!apiKey) throw new Error("Command Code API key required");
@@ -997,54 +1061,7 @@ export class CommandCodeExecutor extends BaseExecutor {
     // Fallback: If /provider/v1/chat/completions returns 403 (e.g. Go plan without Provider
     // API access) or 404, fallback to /alpha/generate (CLI endpoint).
     if (upstream.status === 403 || upstream.status === 404) {
-      const cliUrl = this.buildCliUrl();
-      const cliHeaders: Record<string, string> = {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "x-command-code-version": COMMAND_CODE_VERSION,
-        "x-cli-environment": "external",
-        "x-project-slug": "pi-cc",
-        "x-taste-learning": "false",
-        "x-co-flag": "false",
-        "x-session-id": randomUUID(),
-      };
-      mergeUpstreamExtraHeaders(cliHeaders, upstreamExtraHeaders);
-
-      const { body: cliTransformedBody, toolNameMap } = buildCommandCodeCliBody(
-        model,
-        sanitizedBody,
-        stream
-      );
-
-      const cliUpstream = await fetch(cliUrl, {
-        method: "POST",
-        headers: cliHeaders,
-        body: JSON.stringify(cliTransformedBody),
-        signal: signal || undefined,
-      });
-
-      if (!cliUpstream.ok) {
-        const errorText = await cliUpstream.text().catch(() => {
-          console.warn("[commandCode] cli upstream text failed");
-          return "";
-        });
-        return {
-          response: new Response(errorText || `Command Code API error ${cliUpstream.status}`, {
-            status: cliUpstream.status,
-            statusText: cliUpstream.statusText,
-            headers: cliUpstream.headers,
-          }),
-          url: cliUrl,
-          headers: cliHeaders,
-          transformedBody: cliTransformedBody,
-        };
-      }
-
-      const response = stream
-        ? createStreamResponse(cliUpstream, model, signal, toolNameMap)
-        : await createJsonResponse(cliUpstream, model, signal, toolNameMap);
-
-      return { response, url: cliUrl, headers: cliHeaders, transformedBody: cliTransformedBody };
+      return this.executeCliFallback({ model, sanitizedBody, stream, apiKey, signal, upstreamExtraHeaders });
     }
 
     const errorText = await upstream.text().catch(() => {
