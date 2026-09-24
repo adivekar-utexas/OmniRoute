@@ -47,11 +47,6 @@ import type {
   ResolvedComboUnit,
 } from "./types.ts";
 
-// Re-export the shape types consumed by API-route callers (e.g.
-// src/app/api/v1/combos/projectCombo.ts) so they do not have to reach into
-// ./types.ts for them.
-export type { ComboCollectionLike, ComboLike, ResolvedComboTarget };
-
 /**
  * #8488 / #5240: web-cookie (and similar) providers honestly advertise
  * registry toolCalling:false but still run the prompt-emulated tool shim.

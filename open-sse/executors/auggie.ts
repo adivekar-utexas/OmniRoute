@@ -23,7 +23,7 @@
  *   5. ~/.auggie/bin/auggie                  (alternate installer layout)
  */
 
-import { spawn, type SpawnOptions } from "node:child_process";
+import { spawn, type StdioOptions } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
@@ -94,7 +94,7 @@ export async function initAuggieModels(
   }
   const child = spawn(bin, ["model", "list"], buildAuggieSpawnOptions(["ignore", "pipe", "pipe"]));
   const fragments: string[] = [];
-  child.stdout?.on("data", (d: Buffer) => fragments.push(d.toString("utf8")));
+  child.stdout.on("data", (d: Buffer) => fragments.push(d.toString("utf8")));
   let settled = false;
   const settle = (result: Set<string>) => {
     if (settled) return;
@@ -213,7 +213,18 @@ function buildAuggieArgs(model: string): string[] {
  * elements to the shell, it does not concatenate them into a single
  * command line.
  */
-export function buildAuggieSpawnOptions(stdio: SpawnOptions["stdio"]): SpawnOptions {
+// #14496: `S extends readonly string[]` does not satisfy any `spawn()` overload
+// (TS2769), and once the overload fails the returned ChildProcess is inferred
+// without its stdio streams, which is where the TS18047 "possibly null" pile came
+// from. Constraining to StdioOptions keeps the literal tuple AND matches spawn().
+export function buildAuggieSpawnOptions<S extends StdioOptions>(
+  stdio: S
+): {
+  env: NodeJS.ProcessEnv;
+  stdio: S;
+  shell: boolean;
+  windowsHide: true;
+} {
   return {
     env: process.env,
     stdio,
@@ -488,12 +499,10 @@ export class AuggieExecutor extends BaseExecutor {
     // stdin (not a sync throw), so the try/catch below cannot swallow it — without
     // this handler the unhandled stream error crashes the process instead of
     // letting the child's own 'error'/'close' handlers surface the failure.
-    child.stdin?.on("error", () => {});
+    child.stdin.on("error", () => {});
     try {
-      if (child.stdin) {
-        child.stdin.write(promptText);
-        child.stdin.end();
-      }
+      child.stdin.write(promptText);
+      child.stdin.end();
     } catch {
       /* ignore write errors — 'error'/'close' handlers surface the failure */
     }
