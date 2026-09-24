@@ -65,6 +65,39 @@ function captureFetch(body: Record<string, unknown>) {
   return calls;
 }
 
+/**
+ * Drive the executor through the 403 -> /alpha/generate fallback and return the
+ * Chat-shaped `params` the CLI endpoint actually received.
+ */
+async function captureCliFallback(body: Record<string, unknown>) {
+  const cliCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const urlStr = String(url);
+    cliCalls.push({ url: urlStr, body: JSON.parse(String(init.body)) });
+    if (urlStr.includes("/provider/v1/responses")) {
+      return new Response(
+        JSON.stringify({ error: { message: "upgrade_required", code: "upgrade_required" } }),
+        { status: 403, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    const cliSse =
+      'data: {"type":"text-delta","text":"ok"}\n\n' +
+      'data: {"type":"finish","finishReason":"stop","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2}}\n\n';
+    return new Response(cliSse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  };
+
+  await (await getExecutor("command-code")).execute({
+    model: "gpt-5.6-luna",
+    stream: false,
+    credentials: { apiKey: "cc_go_plan_key" },
+    body,
+  });
+
+  const cli = cliCalls.find((c) => c.url.includes("/alpha/generate"));
+  assert.ok(cli, "expected the CLI fallback to fire");
+  return cli.body.params as Record<string, unknown>;
+}
+
 test.afterEach(() => {
   globalThis.fetch = originalFetch;
 });
@@ -265,6 +298,70 @@ test("Command Code /alpha/generate fallback projects a Responses-shaped body ont
   assert.match(JSON.stringify(sent[0].content), /Hi there/);
   // And the Responses output cap must survive as the CLI's max_tokens.
   assert.equal(params.max_tokens, 256);
+});
+
+test("Command Code /alpha/generate fallback projects Responses tool items onto Chat tool_calls", async () => {
+  const cliBody = await captureCliFallback({
+    input: [
+      { role: "user", content: "What is 2+2?" },
+      { type: "function_call", call_id: "call_1", name: "add", arguments: '{"a":2,"b":2}' },
+      { type: "function_call_output", call_id: "call_1", output: "4" },
+    ],
+  });
+
+  const sent = cliBody.messages as Array<Record<string, unknown>>;
+  assert.equal(sent.length, 3);
+  assert.equal(sent[0].role, "user");
+  assert.equal(sent[1].role, "assistant");
+  // convertMessages flattens tool_calls into content parts; assert on the
+  // semantically load-bearing fields rather than the exact wire shape.
+  const assistant = JSON.stringify(sent[1]);
+  assert.match(assistant, /call_1/);
+  assert.match(assistant, /"add"/);
+  assert.match(assistant, /\\"a\\":2/);
+  assert.equal(sent[2].role, "tool");
+  assert.match(JSON.stringify(sent[2]), /call_1/);
+  assert.match(JSON.stringify(sent[2]), /"4"/);
+});
+
+test("Command Code /alpha/generate fallback maps Responses instructions onto system", async () => {
+  const cliBody = await captureCliFallback({
+    instructions: "You are terse.",
+    input: [{ role: "user", content: "Hi" }],
+  });
+  assert.match(String(cliBody.system), /You are terse\./);
+});
+
+test("Command Code /alpha/generate fallback merges consecutive Responses function_calls into one turn", async () => {
+  const cliBody = await captureCliFallback({
+    input: [
+      { role: "user", content: "Add these" },
+      { type: "function_call", call_id: "c1", name: "add", arguments: '{"a":1}' },
+      { type: "function_call", call_id: "c2", name: "add", arguments: '{"a":2}' },
+      { type: "function_call_output", call_id: "c1", output: "1" },
+      { type: "function_call_output", call_id: "c2", output: "2" },
+    ],
+  });
+
+  const sent = cliBody.messages as Array<Record<string, unknown>>;
+  assert.equal(sent.length, 4, "two calls in one turn collapse into one assistant message");
+  assert.equal(sent[1].role, "assistant");
+  assert.match(JSON.stringify(sent[1]), /c1/);
+  assert.match(JSON.stringify(sent[1]), /c2/);
+});
+
+test("Command Code executor treats a body carrying both input and messages as chat", async () => {
+  // `messages` is the Chat discriminator and wins: `input` is only consulted when
+  // `messages` is absent. Pinned so an accidental flip cannot silently reroute.
+  const calls = captureFetch({});
+  const { url } = await (await getExecutor("command-code")).execute({
+    model: "gpt-5.6-luna",
+    stream: false,
+    credentials: { apiKey: "cc_test_key" },
+    body: { input: [{ role: "user", content: "Hi" }], messages: [{ role: "user", content: "Hi" }] },
+  });
+  assert.equal(url, "https://api.commandcode.ai/provider/v1/chat/completions");
+  assert.equal(calls[0].url, "https://api.commandcode.ai/provider/v1/chat/completions");
 });
 
 test("Command Code /alpha/generate fallback skips a Responses body with no faithful CLI form", async () => {

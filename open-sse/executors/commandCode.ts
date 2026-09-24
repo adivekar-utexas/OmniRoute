@@ -19,6 +19,14 @@ export const COMMAND_CODE_VERSION = process.env.COMMAND_CODE_VERSION?.trim() || 
 // "Too big: expected number to be <=200000 at params.max_tokens". We only clamp
 // a client-supplied value down; we never fabricate this number for requests
 // that omit the field.
+//
+// The quoted error names `params.max_tokens`, which is the /alpha/generate shape.
+// The flat Chat surface uses top-level `max_tokens` and the Responses surface
+// uses `max_output_tokens`; Command Code documents the 200_000 limit only for
+// the first. The same gateway fronts all three, so this constant is applied to
+// every output-cap field on the assumption the ceiling is endpoint-wide. If a
+// live request ever 400s on max_output_tokens at a different bound, split the
+// constant per surface rather than loosening this one.
 const MAX_COMMAND_CODE_TOKENS = 200_000;
 const encoder = new TextEncoder();
 
@@ -125,10 +133,84 @@ function normalizeCommandCodeWireModel(model: string): string {
  * accepts low|medium|high|xhigh|max only, and silently ignores a nested
  * `reasoning.effort`). Route Responses-shaped bodies there so a no-thinking
  * request can actually disable reasoning.
+ *
+ * `messages` is the Chat discriminator and WINS when both are present: `input` is
+ * only consulted when `messages` is absent. A body carrying both is malformed,
+ * and defaulting to the flat Chat surface keeps routing predictable if a payload
+ * override ever injects `messages` into a Responses request.
  */
 function isResponsesShapedBody(body: unknown): boolean {
   if (!isRecord(body)) return false;
   return body.input !== undefined && body.messages === undefined;
+}
+
+/**
+ * Per-type projections from a Responses input item onto Chat messages. The map
+ * keys are exactly the item types that have a faithful Chat form. Anything else
+ * — `reasoning` items, built-in tool calls (`web_search_call`,
+ * `local_shell_call`, …), and any future opaque item — has no CLI
+ * representation. Bailing on those is the only honest option: silently dropping
+ * the item would corrupt the replay.
+ */
+const RESPONSES_ITEM_PROJECTORS: Record<
+  string,
+  (item: JsonRecord, messages: JsonRecord[]) => boolean
+> = {
+  message: projectResponsesMessageItem,
+  function_call: projectResponsesFunctionCallItem,
+  function_call_output: projectResponsesToolOutputItem,
+};
+
+function projectResponsesMessageItem(item: JsonRecord, messages: JsonRecord[]): boolean {
+  const role = stringValue(item.role);
+  if (role !== "user" && role !== "system" && role !== "assistant") return false;
+  messages.push({ role, content: item.content });
+  return true;
+}
+
+function projectResponsesToolOutputItem(item: JsonRecord, messages: JsonRecord[]): boolean {
+  const callId = stringValue(item.call_id) ?? "";
+  if (!callId) return false;
+  messages.push({ role: "tool", tool_call_id: callId, content: item.output });
+  return true;
+}
+
+/**
+ * Project a Responses `function_call` item onto a Chat assistant `tool_calls`
+ * entry. Consecutive calls — and a preceding assistant `message` — collapse into
+ * one assistant turn, matching how Chat groups `tool_calls`.
+ */
+function projectResponsesFunctionCallItem(item: JsonRecord, messages: JsonRecord[]): boolean {
+  const callId = stringValue(item.call_id) ?? "";
+  const name = stringValue(item.name) ?? "";
+  if (!callId || !name) return false;
+  const call: JsonRecord = {
+    id: callId,
+    type: "function",
+    function: { name, arguments: stringValue(item.arguments) ?? "{}" },
+  };
+  const last = messages[messages.length - 1];
+  if (isRecord(last) && last.role === "assistant") {
+    if (!Array.isArray(last.tool_calls)) last.tool_calls = [];
+    (last.tool_calls as JsonRecord[]).push(call);
+  } else {
+    messages.push({ role: "assistant", content: null, tool_calls: [call] });
+  }
+  return true;
+}
+
+/**
+ * Project Responses input items onto Chat messages in place. Returns false when
+ * an item has no faithful Chat form.
+ */
+function projectResponsesItems(items: unknown[], messages: JsonRecord[]): boolean {
+  for (const item of items) {
+    if (!isRecord(item)) return false;
+    const type = typeof item.type === "string" ? item.type : "message";
+    const project = RESPONSES_ITEM_PROJECTORS[type];
+    if (!project || !project(item, messages)) return false;
+  }
+  return true;
 }
 
 /**
@@ -139,10 +221,10 @@ function isResponsesShapedBody(body: unknown): boolean {
  * `input` and `max_output_tokens` instead. Replaying it unchanged sends an empty
  * message list and drops the output cap, so the two have to be projected.
  *
- * Returns `null` when the request has no faithful CLI form. Reasoning items,
- * `function_call`/`function_call_output` items, and encrypted reasoning content
- * are Responses-only; silently dropping them would corrupt the replay, so those
- * bail out and the caller surfaces the upstream error instead.
+ * Returns `null` when the request has no faithful CLI form (see
+ * `projectResponsesItems`); the caller then surfaces the upstream error rather
+ * than replaying a mangled body. `instructions` maps onto `system`, since the
+ * CLI body has no `instructions` field and would otherwise drop it.
  */
 function projectResponsesForCli(body: JsonRecord): JsonRecord | null {
   const raw = body.input;
@@ -151,12 +233,7 @@ function projectResponsesForCli(body: JsonRecord): JsonRecord | null {
   if (typeof raw === "string") {
     messages.push({ role: "user", content: raw });
   } else if (Array.isArray(raw)) {
-    for (const item of raw) {
-      if (!isRecord(item)) return null;
-      const { role, content } = item;
-      if (role !== "user" && role !== "system" && role !== "assistant") return null;
-      messages.push({ role, content });
-    }
+    if (!projectResponsesItems(raw, messages)) return null;
     if (messages.length === 0) return null;
   } else {
     return null;
@@ -168,6 +245,16 @@ function projectResponsesForCli(body: JsonRecord): JsonRecord | null {
     out.max_tokens = body.max_output_tokens;
   }
   delete out.max_output_tokens;
+
+  // Responses carries the system prompt as `instructions`; the CLI body has no
+  // such field and would silently drop it. Map it onto `system` when the request
+  // did not already set one.
+  const instructions = stringValue(body.instructions);
+  if (instructions && !stringValue(out.system)) {
+    out.system = instructions;
+  }
+  delete out.instructions;
+
   return out;
 }
 
