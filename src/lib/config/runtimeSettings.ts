@@ -638,9 +638,15 @@ export async function applyRuntimeSettings(
   // CLI client-version overrides: swap the shared leaf store the Claude Code /
   // Codex identity presets read on every request. Cheap and idempotent, so it is
   // safe on every settings write (dashboard edit, import-json, config restore).
+  //
+  // An ABSENT field is not the same as an empty one here. Both production
+  // callers pass getSettings() output, where the key is always present (default
+  // `{}`), but a caller holding a PARTIAL settings object must never be able to
+  // silently drop a value that goes onto the wire as a client fingerprint —
+  // unlike the visible toggles above, this one failing is invisible.
   if (
-    force ||
-    hasChanged(currentSnapshot.cliVersionOverrides, previousSnapshot.cliVersionOverrides)
+    settings.cliVersionOverrides !== undefined &&
+    (force || hasChanged(currentSnapshot.cliVersionOverrides, previousSnapshot.cliVersionOverrides))
   ) {
     setCliVersionOverrides(currentSnapshot.cliVersionOverrides);
     markChanged("cliVersionOverrides");

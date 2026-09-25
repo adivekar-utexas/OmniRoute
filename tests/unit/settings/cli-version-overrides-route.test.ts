@@ -21,6 +21,7 @@ process.env.INITIAL_PASSWORD = "test-initial-password";
 // above also has to run first so DATA_DIR is isolated before the DB loads.
 const core = await import("../../../src/lib/db/core.ts");
 const settingsDb = await import("../../../src/lib/db/settings.ts");
+const runtime = await import("../../../src/lib/config/runtimeSettings.ts");
 const route = await import("../../../src/app/api/settings/cli-versions/route.ts");
 const cliVersions = await import("../../../src/shared/constants/cliVersions.ts");
 const claude = await import("../../../src/shared/constants/claudeCodeClient.ts");
@@ -154,4 +155,80 @@ test("PUT clears one override with null and the source falls back to default", a
   assert.equal(row.version, null);
   assert.equal(row.effective, claude.CLAUDE_CODE_CLIENT_VERSION);
   assert.equal(row.source, "default");
+});
+
+test("an unrelated settings write does not drop the live overrides", async () => {
+  await route.PUT(
+    await makeManagementSessionRequest(ROUTE_URL, {
+      method: "PUT",
+      body: { claude: "2.1.260" },
+    })
+  );
+
+  // The operator toggles something else entirely on the Settings page.
+  await mockSettings({ requestRetry: 5 });
+
+  assert.deepEqual(cliVersions.getCliVersionOverrides(), { claude: "2.1.260" });
+  assert.equal(claude.getClaudeCodeClientVersion(), "2.1.260");
+});
+
+test("applyRuntimeSettings with a PARTIAL settings object leaves the store alone", async () => {
+  cliVersions.setCliVersionOverrides({ claude: "2.1.260" });
+
+  // Existing tests (and any future caller) pass a minimal shape. The field being
+  // absent must mean "not carried", never "the operator cleared it" — otherwise
+  // a live wire fingerprint silently reverts to the pin.
+  await runtime.applyRuntimeSettings({ systemPrompt: null }, { force: true, source: "test" });
+  await runtime.applyRuntimeSettings({}, { source: "test" });
+
+  assert.deepEqual(cliVersions.getCliVersionOverrides(), { claude: "2.1.260" });
+});
+
+test("applyRuntimeSettings applies a changed value and reports the section", async () => {
+  const applied = await runtime.applyRuntimeSettings(
+    { cliVersionOverrides: { claude: "2.1.260", codex: "0.156.0" } },
+    { source: "test" }
+  );
+  assert.deepEqual(cliVersions.getCliVersionOverrides(), { claude: "2.1.260", codex: "0.156.0" });
+  assert.ok(
+    applied.some((change) => change.section === "cliVersionOverrides"),
+    "the cliVersionOverrides section must be reported as reloaded"
+  );
+
+  // An explicit empty map is the operator clearing it, so it MUST apply: the
+  // non-forced change detection has to see the difference.
+  const cleared = await runtime.applyRuntimeSettings(
+    { cliVersionOverrides: {} },
+    { source: "test" }
+  );
+  assert.deepEqual(cliVersions.getCliVersionOverrides(), {});
+  assert.ok(cleared.some((change) => change.section === "cliVersionOverrides"));
+});
+
+test("getSettings() ships the cliVersionOverrides default on a fresh DB", async () => {
+  const settings = await settingsDb.getSettings();
+  assert.deepEqual(settings.cliVersionOverrides, {});
+});
+
+test("the two kinds are independent: setting codex never moves claude", async () => {
+  await route.PUT(
+    await makeManagementSessionRequest(ROUTE_URL, {
+      method: "PUT",
+      body: { codex: "0.156.0" },
+    })
+  );
+  assert.equal(claude.getClaudeCodeClientVersion(), claude.CLAUDE_CODE_CLIENT_VERSION);
+  assert.equal(claude.getClaudeCodeClientVersionSource(), "default");
+
+  const res = await route.PUT(
+    await makeManagementSessionRequest(ROUTE_URL, {
+      method: "PUT",
+      body: { claude: "2.1.260" },
+    })
+  );
+  const body = (await res.json()) as { items: Array<Record<string, unknown>> };
+  const codexRow = body.items.find((item) => item.key === "codex");
+  assert.ok(codexRow, "codex row should be present");
+  assert.equal(codexRow.effective, "0.156.0");
+  assert.equal(claude.getClaudeCodeClientVersion(), "2.1.260");
 });

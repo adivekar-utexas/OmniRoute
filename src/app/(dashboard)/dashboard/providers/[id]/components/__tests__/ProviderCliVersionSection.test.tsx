@@ -7,6 +7,14 @@ import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ProviderCliVersionSection from "../ProviderCliVersionSection";
+import ProviderExtraPanels from "../ProviderExtraPanels";
+
+// Registration is tested through the real ProviderExtraPanels, so its sibling
+// panels are stubbed out and only this card can contribute text.
+vi.mock("../ProviderPlaygroundPanel", () => ({ default: () => null }));
+vi.mock("../ProviderParamFilterSection", () => ({ default: () => null }));
+vi.mock("../ProviderInterceptionSection", () => ({ default: () => null }));
+vi.mock("../ProviderCcAliasSection", () => ({ default: () => null }));
 
 // Stable references: the load effect depends on `t` and `notify`, so a mock
 // returning a fresh closure/object on every render would re-fire the effect
@@ -236,5 +244,124 @@ describe("ProviderCliVersionSection", () => {
     expect(message).toContain("HTTP 500");
     expect(message).not.toContain("SyntaxError");
     expect(container.textContent).toContain("Could not load the current CLI version settings.");
+  });
+
+  it("is registered in ProviderExtraPanels, and only for claude/codex", async () => {
+    vi.stubGlobal("fetch", stubGet(CLAUDE_ROW));
+
+    const claudeBox = renderComponent(<ProviderExtraPanels providerId="claude" />);
+    await flush();
+    expect(claudeBox.textContent).toContain("Advertised CLI client version");
+
+    const codexBox = renderComponent(<ProviderExtraPanels providerId="codex" />);
+    await flush();
+    expect(codexBox.textContent).toContain("Advertised CLI client version");
+
+    const otherBox = renderComponent(<ProviderExtraPanels providerId="openai" />);
+    await flush();
+    expect(otherBox.textContent).not.toContain("Advertised CLI client version");
+  });
+
+  it("disables Save until the draft differs, and Reset when nothing is overridden", async () => {
+    vi.stubGlobal("fetch", stubGet(CLAUDE_ROW));
+    const container = renderComponent(<ProviderCliVersionSection providerId="claude" />);
+    await flush();
+
+    const [save, reset] = Array.from(container.querySelectorAll("button"));
+    expect(save?.disabled, "Save must be inert while the draft is unchanged").toBe(true);
+    expect(reset?.disabled, "Reset must be inert with no override to clear").toBe(true);
+
+    const input = container.querySelector("input");
+    if (!(input instanceof HTMLInputElement)) throw new Error("expected a version input");
+    typeInto(input, "2.1.260");
+    expect(save?.disabled, "typing a new value must arm Save").toBe(false);
+  });
+
+  it("submits on Enter in the version input", async () => {
+    const calls: Array<{ init?: RequestInit }> = [];
+    let saved = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: unknown, init?: RequestInit) => {
+        if (init?.method === "PUT") saved = true;
+        calls.push({ init });
+        return Promise.resolve(
+          jsonResponse({
+            items: [
+              {
+                ...CLAUDE_ROW,
+                version: saved ? "2.1.260" : null,
+                effective: saved ? "2.1.260" : "2.1.258",
+                source: saved ? "settings" : "default",
+              },
+            ],
+          })
+        );
+      })
+    );
+
+    const container = renderComponent(<ProviderCliVersionSection providerId="claude" />);
+    await flush();
+
+    const input = container.querySelector("input");
+    if (!(input instanceof HTMLInputElement)) throw new Error("expected a version input");
+    typeInto(input, "2.1.260");
+    // Let React commit the draft before the key event, and mark it cancelable
+    // because the handler calls preventDefault().
+    await flush();
+    await act(async () => {
+      input.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })
+      );
+    });
+    await flush();
+
+    const put = calls.find((c) => c.init?.method === "PUT");
+    if (!put?.init) throw new Error("Enter should have submitted the override");
+    expect(put.init.body).toBe(JSON.stringify({ claude: "2.1.260" }));
+  });
+
+  it("keeps the draft and reports the error when a save fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: unknown, init?: RequestInit) =>
+        Promise.resolve(
+          init?.method === "PUT"
+            ? jsonResponse({ error: "upstream rejected it" }, 400)
+            : jsonResponse({ items: [CLAUDE_ROW] })
+        )
+      )
+    );
+
+    const container = renderComponent(<ProviderCliVersionSection providerId="claude" />);
+    await flush();
+
+    const input = container.querySelector("input");
+    if (!(input instanceof HTMLInputElement)) throw new Error("expected a version input");
+    typeInto(input, "2.1.260");
+    clickButton(container, "Save");
+    await flush();
+
+    expect(notifyError).toHaveBeenCalledTimes(1);
+    expect(input.value, "a failed save must not discard what the operator typed").toBe("2.1.260");
+  });
+
+  it("shows the skeleton until the load settles, not a half-drawn card", async () => {
+    let release: (value: unknown) => void = () => {};
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    vi.stubGlobal("fetch", vi.fn(() => gate.then(() => jsonResponse({ items: [CLAUDE_ROW] }))));
+
+    const container = renderComponent(<ProviderCliVersionSection providerId="claude" />);
+    expect(container.querySelector(".animate-pulse"), "skeleton expected").toBeTruthy();
+    expect(container.textContent).toBe("");
+
+    await act(async () => {
+      release(undefined);
+      await gate;
+    });
+    await flush();
+    expect(container.textContent).toContain("Advertised CLI client version");
   });
 });
