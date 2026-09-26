@@ -51,6 +51,10 @@ test("normalizeCliVersion accepts the version tokens a real CLI sends", () => {
   }
   // Exactly 32 characters is still inside the bound.
   assert.equal(normalizeCliVersion("a".repeat(32)), "a".repeat(32));
+  // CLI_VERSION_PATTERN is the rule the store enforces, so it must agree with
+  // normalizeCliVersion at the boundary.
+  assert.ok(CLI_VERSION_PATTERN.test("a".repeat(32)));
+  assert.ok(!CLI_VERSION_PATTERN.test("a".repeat(33)));
 });
 
 test("normalizeCliVersion trims accidental whitespace but drops unsafe tokens", () => {
