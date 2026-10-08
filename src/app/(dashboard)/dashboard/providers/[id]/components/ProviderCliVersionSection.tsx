@@ -28,6 +28,7 @@ const SUPPORTED_PROVIDER_IDS = new Set(["claude", "codex"]);
 const SOURCE_LABELS: Record<CliVersionSource, { key: string; fallback: string }> = {
   settings: { key: "cliVersionSourceSettings", fallback: "dashboard override" },
   env: { key: "cliVersionSourceEnv", fallback: "environment variable" },
+  discovered: { key: "cliVersionSourceDiscovered", fallback: "auto-discovered latest release" },
   default: { key: "cliVersionSourceDefault", fallback: "captured default" },
 };
 const API_PATH = "/api/settings/cli-versions";

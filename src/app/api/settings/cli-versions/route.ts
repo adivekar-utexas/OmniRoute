@@ -33,7 +33,7 @@ import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 // Each kind's NON-caller-aware chain (auth / backend identity). The Codex
 // INFERENCE path additionally forwards the caller's own version ABOVE the env
-// layer — see resolveCodexClientVersion; the dashboard card carries that caveat.
+// layer — see resolveCodexAdvertisedVersion; the dashboard card carries that caveat.
 const RESOLVERS: Record<
   CliVersionKey,
   { resolve: () => string; source: () => CliVersionSource; pinned: string }

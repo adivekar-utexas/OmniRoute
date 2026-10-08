@@ -162,7 +162,10 @@ test("Codex precedence: falls to the captured default when nothing is set", asyn
     resetOverrides();
     assert.equal(codex.getCodexClientVersion(), codex.DEFAULT_CODEX_CLIENT_VERSION);
     assert.equal(codex.getCodexClientVersionSource(), "default");
-    assert.equal(codex.resolveCodexClientVersion(undefined), codex.DEFAULT_CODEX_CLIENT_VERSION);
+    assert.equal(
+      codex.resolveCodexAdvertisedVersion(undefined),
+      codex.DEFAULT_CODEX_CLIENT_VERSION
+    );
   });
 });
 
@@ -171,7 +174,7 @@ test("Codex precedence: env wins over the default when no override is set", asyn
     resetOverrides();
     assert.equal(codex.getCodexClientVersion(), "0.153.0");
     assert.equal(codex.getCodexClientVersionSource(), "env");
-    assert.equal(codex.resolveCodexClientVersion(null), "0.153.0");
+    assert.equal(codex.resolveCodexAdvertisedVersion(null), "0.153.0");
   });
 });
 
@@ -181,14 +184,14 @@ test("Codex inference: the caller's own version beats CODEX_CLIENT_VERSION", asy
   await withEnv({ CODEX_CLIENT_VERSION: "0.153.0" }, () => {
     resetOverrides();
     assert.equal(codex.getCodexClientVersionFromHeaders(CALLER_HEADERS), "0.154.0");
-    assert.equal(codex.resolveCodexClientVersion(CALLER_HEADERS), "0.154.0");
+    assert.equal(codex.resolveCodexAdvertisedVersion(CALLER_HEADERS), "0.154.0");
   });
 });
 
 test("Codex inference: the dashboard override outranks the caller's forwarded version", async () => {
   await withEnv({ CODEX_CLIENT_VERSION: "0.153.0" }, () => {
     setCliVersionOverrides({ codex: "0.156.0" });
-    assert.equal(codex.resolveCodexClientVersion(CALLER_HEADERS), "0.156.0");
+    assert.equal(codex.resolveCodexAdvertisedVersion(CALLER_HEADERS), "0.156.0");
     assert.equal(codex.getCodexClientVersionSource(), "settings");
     resetOverrides();
   });
@@ -197,18 +200,119 @@ test("Codex inference: the dashboard override outranks the caller's forwarded ve
 test("Codex inference: a safe `version` header is forwarded verbatim", async () => {
   await withEnv({ CODEX_CLIENT_VERSION: "0.153.0" }, () => {
     resetOverrides();
-    assert.equal(codex.resolveCodexClientVersion({ version: "0.155.0" }), "0.155.0");
+    assert.equal(codex.resolveCodexAdvertisedVersion({ version: "0.155.0" }), "0.155.0");
   });
 });
 
 test("Codex inference: unusable caller headers fall through to env then default", async () => {
   await withEnv({ CODEX_CLIENT_VERSION: undefined }, () => {
     resetOverrides();
-    assert.equal(codex.resolveCodexClientVersion({}), codex.DEFAULT_CODEX_CLIENT_VERSION);
-    assert.equal(codex.resolveCodexClientVersion({ version: "not a version" }),
-      codex.DEFAULT_CODEX_CLIENT_VERSION);
-    assert.equal(codex.resolveCodexClientVersion({ "user-agent": "curl/8.0" }),
-      codex.DEFAULT_CODEX_CLIENT_VERSION);
+    assert.equal(codex.resolveCodexAdvertisedVersion({}), codex.DEFAULT_CODEX_CLIENT_VERSION);
+    assert.equal(
+      codex.resolveCodexAdvertisedVersion({ version: "not a version" }),
+      codex.DEFAULT_CODEX_CLIENT_VERSION
+    );
+    assert.equal(
+      codex.resolveCodexAdvertisedVersion({ "user-agent": "curl/8.0" }),
+      codex.DEFAULT_CODEX_CLIENT_VERSION
+    );
+  });
+});
+
+// Discovery layer (#15663 landed automatic version discovery on the base while
+// this PR was open). Effective precedence after the merge:
+//   dashboard override > env > discovered cache newer than the pin > pin.
+function bumpTriple(version: string): string {
+  const [major, minor, patch] = version.split(".").map(Number);
+  return `${major}.${minor}.${patch + 7}`;
+}
+
+function npmLatest(version: string): typeof fetch {
+  return (async () =>
+    new Response(JSON.stringify({ version }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch;
+}
+
+test("Claude precedence: a discovered npm version newer than the pin reports `discovered`", async () => {
+  const discovered = bumpTriple(claude.CLAUDE_CODE_CLIENT_VERSION);
+  await withEnv({ CLAUDE_CODE_CLIENT_VERSION: undefined }, async () => {
+    resetOverrides();
+    claude.resetClaudeCodeClientVersionCache();
+    try {
+      assert.equal(await claude.refreshClaudeCodeClientVersion(npmLatest(discovered)), discovered);
+      assert.equal(claude.getClaudeCodeClientVersion(), discovered);
+      assert.equal(claude.getClaudeCodeClientVersionSource(), "discovered");
+    } finally {
+      claude.resetClaudeCodeClientVersionCache();
+    }
+  });
+});
+
+test("Claude precedence: env and the dashboard override both outrank a discovered version", async () => {
+  const discovered = bumpTriple(claude.CLAUDE_CODE_CLIENT_VERSION);
+  await withEnv({ CLAUDE_CODE_CLIENT_VERSION: "2.1.259" }, async () => {
+    resetOverrides();
+    claude.resetClaudeCodeClientVersionCache();
+    try {
+      await withEnv({ CLAUDE_CODE_CLIENT_VERSION: undefined }, () =>
+        claude.refreshClaudeCodeClientVersion(npmLatest(discovered))
+      );
+      assert.equal(claude.getClaudeCodeClientVersion(), "2.1.259");
+      assert.equal(claude.getClaudeCodeClientVersionSource(), "env");
+      setCliVersionOverrides({ claude: "2.1.261" });
+      assert.equal(claude.getClaudeCodeClientVersion(), "2.1.261");
+      assert.equal(claude.getClaudeCodeClientVersionSource(), "settings");
+    } finally {
+      resetOverrides();
+      claude.resetClaudeCodeClientVersionCache();
+    }
+  });
+});
+
+test("Claude refresh: a dashboard override short-circuits the registry lookup", async () => {
+  await withEnv({ CLAUDE_CODE_CLIENT_VERSION: undefined }, async () => {
+    claude.resetClaudeCodeClientVersionCache();
+    setCliVersionOverrides({ claude: "2.1.261" });
+    let calls = 0;
+    const counting = (async () => {
+      calls += 1;
+      return new Response("{}", { status: 500 });
+    }) as unknown as typeof fetch;
+    try {
+      assert.equal(await claude.refreshClaudeCodeClientVersion(counting), "2.1.261");
+      assert.equal(calls, 0);
+    } finally {
+      resetOverrides();
+      claude.resetClaudeCodeClientVersionCache();
+    }
+  });
+});
+
+test("Codex precedence: a discovered release newer than the pin reports `discovered`", async () => {
+  const discovered = bumpTriple(codex.DEFAULT_CODEX_CLIENT_VERSION);
+  await withEnv({ CODEX_CLIENT_VERSION: undefined }, () => {
+    resetOverrides();
+    codex.clearCodexClientVersionCache();
+    codex.resetCodexClientVersionCacheForTests();
+    try {
+      codex.seedCodexClientVersionCache(discovered);
+      assert.equal(codex.getCodexClientVersion(), discovered);
+      assert.equal(codex.getCodexClientVersionSource(), "discovered");
+      // The inference face still forwards the caller's own version first...
+      assert.equal(codex.resolveCodexAdvertisedVersion(CALLER_HEADERS), "0.154.0");
+      // ...and falls to the discovered version when the caller sends none.
+      assert.equal(codex.resolveCodexAdvertisedVersion({}), discovered);
+      setCliVersionOverrides({ codex: "0.156.0" });
+      assert.equal(codex.getCodexClientVersion(), "0.156.0");
+      assert.equal(codex.getCodexClientVersionSource(), "settings");
+      assert.equal(codex.resolveCodexAdvertisedVersion(CALLER_HEADERS), "0.156.0");
+    } finally {
+      resetOverrides();
+      codex.clearCodexClientVersionCache();
+      codex.resetCodexClientVersionCacheForTests();
+    }
   });
 });
 

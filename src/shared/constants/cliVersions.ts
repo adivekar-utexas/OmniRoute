@@ -36,7 +36,7 @@ export function isCliVersionKey(value: unknown): value is CliVersionKey {
 
 /** Where an advertised version came from — surfaced in the dashboard so an
  * operator can tell at a glance whether their override is actually in effect. */
-export type CliVersionSource = "settings" | "env" | "default";
+export type CliVersionSource = "settings" | "env" | "discovered" | "default";
 
 /**
  * One provider kind as the dashboard sees it: the operator override (null when
@@ -112,5 +112,3 @@ export function hydrateCliVersionOverrides(settings: unknown): boolean {
   setCliVersionOverrides(record.cliVersionOverrides);
   return Object.keys(overrides).length > 0;
 }
-
-
